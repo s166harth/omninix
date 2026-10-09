@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# nixmarchy-shell-run: launch the nixmarchy-shell host with the qs.Commons
+# portal on the QML import path AHEAD of the user config dir, so third-party
+# `import qs.Commons` resolves to the portal (Color/Style/Util subset) and
+# never to the user's own `Commons` module.
+#
+# Usage: nixmarchy-shell-run [--no-color] [qs args...]
+set -euo pipefail
+SHELL_DIR="${NIXMARCHY_SHELL_DIR:-$HOME/.config/nixmarchy-shell}"
+export NIXMARCHY_SHELL_DIR="$SHELL_DIR"
+PORTAL="${NIXMARCHY_COMMONS_DIR:-@commonsQml@}"
+if [[ ! -d $PORTAL && -d $HOME/.config/nixmarchy/Commons.qs ]]; then
+    PORTAL="$HOME/.config/nixmarchy/Commons.qs"
+fi
+if [[ -n ${QML_IMPORT_PATH:-} ]]; then
+    export QML_IMPORT_PATH="$PORTAL:$QML_IMPORT_PATH"
+else
+    export QML_IMPORT_PATH="$PORTAL"
+fi
+exec quickshell --path "$SHELL_DIR" "$@"

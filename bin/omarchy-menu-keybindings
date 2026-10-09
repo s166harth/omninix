@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# omarchy-menu-keybindings: nixmarchy shim for Omarchy's keybinding resolver.
+#
+# Omarchy ships this as the tool behind SUPER + K (an interactive keybind menu)
+# and as the record exporter plugins source. nixmarchy has no Omarchy menu, so
+# this implements the two interfaces plugins actually use, reading the live
+# binding table from `hyprctl -j binds` instead of Omarchy's Lua config:
+#
+#   --print                  "COMBO → description" per line
+#   output_binding_records   "COMBO → description\tdispatcher\targ" per line
+#
+# Both match the upstream line format (`printf "%-*s → %s\t%s\t%s\n"`), so
+# consumers parse identically.
+#
+# IMPORTANT: the `output_keybindings() {` marker below is load-bearing.
+# Consumers (e.g. fkcodes.key-promoter/bin/keybinds) extract the definitions
+# with `sed -n '1,/^output_keybindings() {/p' | sed '$d'` and `source` them,
+# so every function definition must appear ABOVE the marker, and nothing above
+# it may execute at source time (no top-level statements, no `set -e`).
+
+# Hyprland modmask bits. Upstream's textual order is SUPER, SHIFT, CTRL, ALT
+# (e.g. 77 -> "SUPER SHIFT CTRL ALT").
+modmask_to_text() {
+    local mask="$1" out="" bit
+    if ((mask & 64)); then out="SUPER"; fi
+    if ((mask & 1)); then out="${out:+$out }SHIFT"; fi
+    if ((mask & 4)); then out="${out:+$out }CTRL"; fi
+    if ((mask & 8)); then out="${out:+$out }ALT"; fi
+    # Any remaining bits (MOD2/MOD3/MOD5...) have no Omarchy name; keep the raw
+    # number so the combo stays honest rather than silently dropping modifiers.
+    bit=$((mask & ~(64 | 1 | 4 | 8)))
+    if ((bit != 0)); then out="${out:+$out }$bit"; fi
+    printf '%s' "$out"
+}
+
+# Hyprland reports XKB symbol names, mixing cases; upstream title-cases the
+# punctuation symbols and leaves named keys alone.
+normalize_key() {
+    case "$1" in
+        comma) printf 'COMMA' ;;
+        period) printf 'PERIOD' ;;
+        minus) printf 'MINUS' ;;
+        equal) printf 'EQUAL' ;;
+        slash) printf 'SLASH' ;;
+        grave) printf '~' ;;
+        [a-z]) printf '%s' "$1" | tr '[:lower:]' '[:upper:]' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# Human label for binds that carry none.
+#
+# Hyprland only reports a description for binds declared with one; this box's
+# hyprlang config declares none, so every label would be empty and the toast
+# would show a bare chord. Derive one from the command for `exec` binds (the
+# only kind plugins promote); other dispatchers stay undescribed.
+describe() {
+    local dispatcher="$1" arg="$2" cmd
+    [[ $dispatcher == exec ]] || return 0
+    arg="${arg#*] }"   # drop Hyprland arg flags, e.g. "[workspace 1 silent] "
+    cmd="${arg%% *}"
+    cmd="${cmd##*/}"
+    [[ -n $cmd ]] || return 0
+    printf '%s' "$cmd" | sed 's/[-_]/ /g' | awk '{ for (i = 1; i <= NF; i++) $i = toupper(substr($i, 1, 1)) substr($i, 2); print }'
+}
+
+# One line per keyboard bind: modmask, key, description, dispatcher, arg.
+hyprctl_records() {
+    hyprctl -j binds | jq -r '
+    .[]
+    | select((.mouse // false) == false)
+    | select((.key // "") != "")
+    | select((.key | test("^(mouse:|switch:)") | not))
+    | [ (.modmask | tostring), .key, (.description // ""), (.dispatcher // ""), (.arg // "") ]
+    | join("\u001f")'
+}
+
+output_binding_records() {
+    local column=28 modmask key description dispatcher arg mods combo
+    # \x1f (not tab): tab is IFS-whitespace, so an empty description would
+    # collapse and shift dispatcher/arg left.
+    hyprctl_records | while IFS=$'\x1f' read -r modmask key description dispatcher arg; do
+        [[ -n $modmask && -n $key ]] || continue
+        # Hyprland exec args may carry a leading window-rule group, e.g.
+        # "[workspace 1 silent] zen-beta" or "[float; size 1111 700] ghostty".
+        # It is not part of the command, and consumers derive the app identity
+        # from the first token, so an unstripped group turns every such bind
+        # into an unmatchable signature.
+        arg=$(printf '%s' "$arg" | sed 's/^\(\[[^]]*\] \)*//')
+        mods=$(modmask_to_text "$modmask")
+        key=$(normalize_key "$key")
+        if [[ -n $mods ]]; then combo="$mods + $key"; else combo="$key"; fi
+        [[ -n $description ]] || description=$(describe "$dispatcher" "$arg")
+        printf '%-*s → %s\t%s\t%s\n' "$column" "$combo" "$description" "$dispatcher" "$arg"
+    done
+}
+
+output_keybindings() {
+    output_binding_records | cut -f1
+}
+
+# ---------------------------------------------------------------------------
+# Direct execution only. Consumers `source` the prefix above and never reach
+# this block.
+set -euo pipefail
+
+case "${1:-}" in
+    --print | -p)
+        output_keybindings
+        ;;
+    --records | -r | "")
+        output_binding_records
+        ;;
+    *)
+        cat >&2 <<USAGE
+usage: omarchy-menu-keybindings [--print | --records]
+
+  --print     "COMBO → description" per line (the plugin-facing listing)
+  --records   "COMBO → description<TAB>dispatcher<TAB>arg" per line
+
+nixmarchy shim: reads the live table from \`hyprctl -j binds\`; Omarchy's own
+interactive keybind menu (SUPER + K) is not implemented here.
+USAGE
+        exit 1
+        ;;
+esac

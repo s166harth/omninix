@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# omarchy-notification-send: OMARCHY_PATH/bin/omarchy-notification-send
+# equivalent for nixmarchy. Upstream signature (consumed by first-party
+# plugins' bin/* helpers, e.g. neil.yautja):
+#   omarchy-notification-send -g <glyph> -t <ms> <title> [body]
+# Maps to notify-send (libnotify). nixmarchy-notification-send keeps the
+# plugin-host facade signature (<title> <body>) — this shim keeps the
+# upstream CLI signature so plugin helper scripts work unmodified.
+set -euo pipefail
+
+glyph=""
+timeout="3500"
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -g) glyph="${2:-}"; shift 2 ;;
+        -t) timeout="${2:-3500}"; shift 2 ;;
+        *) break ;;
+    esac
+done
+
+title="${1:-nixmarchy}"
+shift || true
+
+exec notify-send -a "omarchy" -u normal \
+    ${glyph:+-h string:x-canonical-private-icon:"$glyph"} \
+    -t "$timeout" \
+    "$title" "${*:-}"

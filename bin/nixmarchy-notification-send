@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# nixmarchy-notification-send: OMARCHY_PATH/bin/omarchy-notification-send
+# equivalent for plugins hosted by nixmarchy-shell. The literal-web-crawler
+# Crawler.qml grim-missing path calls
+#   $omarchyPath/bin/omarchy-notification-send <title> <body>
+# We map to notify-send (libnotify, already in home packages).
+set -euo pipefail
+title="${1:-nixmarchy}"
+shift || true
+exec notify-send -a "nixmarchy" "$title" "$*"

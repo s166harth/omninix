@@ -1,0 +1,861 @@
+#!/usr/bin/env bash
+# nixmarchy: Omarchy-style shell plugin manager for the nixmarchy-shell host.
+#
+#   nixmarchy install <git-url | plugin-page-url> [--yes] [--priority N]
+#   nixmarchy list [--json]
+#   nixmarchy enable <id> [--priority N] | nixmarchy disable <id>
+#   nixmarchy summon <id> [payloadJson] | nixmarchy hide <id> | nixmarchy toggle <id> [payloadJson]
+#   nixmarchy update [id] | nixmarchy remove <id> | nixmarchy validate [dir]
+#
+# Plugin page URLs (https://plugins.omarchy.org/plugin.html?id=<id>) resolve
+# to their git URL via the pinned catalog, exactly like the marketplace's own
+# install command. Git URLs are normalised to the .git form the catalog uses.
+#
+# State lives in ~/.local/state/nixmarchy/: plugins/<id>/ checkouts,
+# registry.json (id -> rev/url/enabled/priority/installedAt), shell.json
+# (enabled ids + idle config, host-read). Non-interactive everywhere except
+# --yes: pass --yes when stdin is not a TTY.
+#
+# No sudo, no network at activation: all network happens here, at the user.
+
+set -euo pipefail
+
+STATE_DIR="${NIXMARCHY_STATE_DIR:-$HOME/.local/state/nixmarchy}"
+PLUGINS_DIR="$STATE_DIR/plugins"
+REGISTRY="$STATE_DIR/registry.json"
+CATALOG_CACHE="$STATE_DIR/catalog.json"
+CATALOG_URL="${NIXMARCHY_CATALOG_URL:-https://plugins.omarchy.org/catalog.json}"
+
+fail() {
+    echo "nixmarchy: $*" >&2
+    exit 1
+}
+
+need() {
+    command -v "$1" >/dev/null 2>&1 || fail "missing required tool: $1"
+}
+
+registry_init() {
+    mkdir -p "$PLUGINS_DIR"
+    [[ -f $REGISTRY ]] || echo '{"version":1,"plugins":{}}' >"$REGISTRY"
+}
+
+registry_get() {
+    jq -r --arg id "$1" '.plugins[$id] // empty' "$REGISTRY"
+}
+
+registry_set() {
+    local id="$1"
+    local json="$2"
+    local tmp="$REGISTRY.tmp.$$"
+    jq --arg id "$id" --argjson v "$json" '.plugins[$id] = $v' "$REGISTRY" >"$tmp"
+    mv "$tmp" "$REGISTRY"
+}
+
+registry_del() {
+    local tmp="$REGISTRY.tmp.$$"
+    jq --arg id "$1" 'del(.plugins[$id])' "$REGISTRY" >"$tmp"
+    mv "$tmp" "$REGISTRY"
+}
+
+registry_has() {
+    jq -e --arg id "$1" 'has("plugins") and (.plugins | has($id))' "$REGISTRY" >/dev/null 2>&1
+}
+
+# ---- URL handling ----
+
+page_id_of() {
+    # plugin.html?id=<id>[&...] -> <id>; empty otherwise
+    local url="$1"
+    [[ $url == *plugin.html*"?id="* || $url == *plugin.html*"&id="* || $url == *plugin.html*"?id="* ]] || return 1
+    local q="${url#*\?}"
+    local id=""
+    local pair
+    IFS='&' read -ra _pairs <<<"$q" || true
+    for pair in "${_pairs[@]}"; do
+        case "$pair" in
+            id=*) id="${pair#id=}" ;;
+        esac
+    done
+    [[ -n $id ]] || return 1
+    printf '%s' "$id"
+}
+
+fetch_catalog() {
+    # Refresh only when older than 24h or missing; silent best-effort.
+    if [[ -f $CATALOG_CACHE ]]; then
+        local age
+        age=$(($(date +%s) - $(stat -c %Y "$CATALOG_CACHE")))
+        ((age < 86400)) && return 0
+    fi
+    curl -sfL --max-time 60 "$CATALOG_URL" -o "$CATALOG_CACHE.tmp" 2>/dev/null \
+        && mv "$CATALOG_CACHE.tmp" "$CATALOG_CACHE" || true
+}
+
+catalog_entry() {
+    # $1 = plugin id -> prints repo URL (git form, no trailing slash)
+    local id="$1"
+    [[ -f $CATALOG_CACHE ]] || return 1
+    jq -r --arg id "$id" '
+        (if type == "array" then . else (.plugins // .items // []) end)
+        | map(select(.id == $id))[0]
+        | (.repo // empty)
+    ' "$CATALOG_CACHE" | sed -e 's:/*$::'
+}
+
+normalize_git_url() {
+    # marketplace form: https://github.com/user/repo[.git] (fragment/query stripped)
+    local url="$1"
+    url="${url%%\?*}"
+    url="${url%%\#*}"
+    url="${url%/}"
+    # local paths never take a .git suffix (bare dirs are valid git repos)
+    case "$url" in
+        file://* | /* | ./* | ../*) printf '%s' "$url"; return 0 ;;
+    esac
+    [[ $url == *.git ]] || url="$url.git"
+    printf '%s' "$url"
+}
+
+# Mirrors omarchy-git-url-check: refuse git transport tricks before touching
+# the network, so an untrusted URL cannot run a command.
+check_git_url() {
+    local url="$1"
+    case "$url" in
+        -*) fail "refusing URL that looks like a git option: $url" ;;
+        *$'\n'* | *$'\r'*) fail "refusing URL with control characters" ;;
+    esac
+    case "$url" in
+        https://* | http://* | git://* | ssh://* | file://* | git@*:*) ;;
+        *) fail "refusing non-git URL: $url" ;;
+    esac
+    case "$url" in
+        *--upload-pack=* | *--exec=* | *--receive-pack=* | *ext::* | *fd::*)
+            fail "refusing URL with transport override: $url"
+            ;;
+    esac
+}
+
+# ---- validation (mirrors bin/omarchy-plugin-validate) ----
+
+cmd_validate() {
+    local dir="${1:-}"
+    [[ -n $dir && -d $dir ]] || fail "plugin folder not found: ${dir:-<none>}"
+    local manifest="$dir/manifest.json"
+    [[ -f $manifest ]] || fail "missing manifest.json in $dir"
+    jq -e . "$manifest" >/dev/null 2>&1 || fail "manifest.json is not valid JSON"
+    jq -e '.schemaVersion == 1' "$manifest" >/dev/null 2>&1 \
+        || fail "unsupported or missing schemaVersion (expected 1)"
+    local field
+    for field in id name version kinds entryPoints; do
+        jq -e --arg f "$field" 'has($f)' "$manifest" >/dev/null 2>&1 \
+            || fail "manifest missing required field '$field'"
+    done
+    local id
+    id=$(jq -r '.id // ""' "$manifest")
+    [[ -n $id ]] || fail "manifest 'id' is empty"
+    [[ $id =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail "invalid plugin id '$id'"
+    [[ $id != *".."* ]] || fail "invalid plugin id '$id'"
+    [[ $id != omarchy.* ]] || fail "plugin id '$id' uses the reserved omarchy.* namespace"
+    jq -e '(.kinds | type) == "array" and (.kinds | length) > 0' "$manifest" >/dev/null 2>&1 \
+        || fail "'kinds' must be a non-empty array"
+    jq -e '(.entryPoints | type) == "object"' "$manifest" >/dev/null 2>&1 \
+        || fail "'entryPoints' must be an object"
+    jq -e '
+        if ((.barWidget? | type) == "object" and (.barWidget | has("defaultSection"))) then
+            .barWidget.defaultSection as $section
+            | ($section | type) == "string"
+              and (["left", "center", "right"] | index($section)) != null
+        else true end
+    ' "$manifest" >/dev/null 2>&1 \
+        || fail "'barWidget.defaultSection' must be left, center, or right"
+    local ep_json ep
+    while IFS= read -r ep_json; do
+        [[ -n $ep_json ]] || continue
+        ep=$(jq -r '.' <<<"$ep_json")
+        [[ -n $ep ]] || fail "entry point path is empty"
+        [[ $ep != /* ]] || fail "entry point must be a relative path: '$ep'"
+        [[ $ep != *".."* ]] || fail "entry point may not contain '..': '$ep'"
+        [[ -f $dir/$ep ]] || fail "entry point file not found: '$ep'"
+    done < <(jq -c '.entryPoints | to_entries[] | .value' "$manifest")
+    local kind_entry_point kind entry_point
+    for kind_entry_point in bar:bar bar-widget:barWidget menu:menu overlay:overlay panel:panel service:service; do
+        kind="${kind_entry_point%%:*}"
+        entry_point="${kind_entry_point##*:}"
+        jq -e --arg kind "$kind" '(.kinds | index($kind)) != null' "$manifest" >/dev/null 2>&1 || continue
+        jq -e --arg ep "$entry_point" '.entryPoints | has($ep)' "$manifest" >/dev/null 2>&1 \
+            || fail "kind '$kind' requires an 'entryPoints.$entry_point' to load"
+    done
+    local link
+    link=$(find "$dir" -name .git -prune -o -type l -print -quit 2>/dev/null)
+    [[ -z $link ]] || fail "symlinks are not allowed inside a plugin folder: $link"
+    echo "valid: $id"
+}
+
+# ---- plugin profile wiring ----
+# Each plugin lands in the CURRENT nix profile as an immutable store dir
+# (nix store add; GC-rooted via the profile). The shell reads checkouts
+# through a symlink farm at ~/.config/nixmarchy/plugins/<id> so qs
+# hot-reload + IPC stay live without rebuilds.
+profile_name_for() {
+    printf 'nixmarchy-plugin-%s' "$1"
+}
+sync_profile_links() {
+    local linkdir="$HOME/.config/nixmarchy/plugins"
+    mkdir -p "$linkdir"
+    local id storepath
+    while IFS=$'\t' read -r id storepath; do
+        [[ -n $id && -n $storepath && -d $storepath ]] || continue
+        ln -sfn "$storepath" "$linkdir/$id"
+    done < <(jq -r '.plugins | to_entries[] | [.key, (.value.storePath // empty)] | @tsv' "$REGISTRY")
+}
+# ---- plugin CLI wiring (CLI-first installs) -----------------------------------
+# Plugins ship bundled helper CLIs (bin/*, scripts/*). nixmarchy installs
+# expose them as shell commands so plugins work with "no mount nowhere":
+#   ~/.local/bin/<cmd> -> <checkout>/bin/<cmd>
+# Name collisions across plugins refuse (last-installed does NOT win here)
+# because silently shadowing a user command is unsafe; the colliding install
+# fails with the owner named. Registered (linked) name <-> plugin id mapping
+# lives in $STATE_DIR/cli.json, which update/remove consult too.
+CLI_DIR="$HOME/.local/bin"
+CLI_INDEX="$STATE_DIR/cli.json"
+# Shebang-normalized plugin copies (see normalize_plugin_shebangs).
+PATCH_DIR="$STATE_DIR/patched"
+
+cli_init() {
+    mkdir -p "$CLI_DIR"
+    [[ -f $CLI_INDEX ]] || echo '{"version":1,"links":{}}' >"$CLI_INDEX"
+}
+
+cli_index_get() {
+    jq -r --arg c "$1" '.links[$c] // empty' "$CLI_INDEX"
+}
+
+cli_index_set() {
+    # $1=cmd $2=id rest=target
+    local cmd="$1" id="$2"
+    shift 2
+    local tmp="$CLI_INDEX.tmp.$$"
+    jq --arg c "$cmd" --arg id "$id" --arg t "$1" '.links[$c] = {id:$id, target:$t}' "$CLI_INDEX" >"$tmp"
+    mv "$tmp" "$CLI_INDEX"
+}
+
+cli_index_del() {
+    local tmp="$CLI_INDEX.tmp.$$"
+    jq --arg c "$1" 'del(.links[$1])' "$CLI_INDEX" >"$tmp"
+    mv "$tmp" "$CLI_INDEX"
+}
+
+link_plugin_clis() {
+    # $1 = plugin id, $2 = checkout dir -> links every executable under
+    # bin/ and scripts/. Refuses on name collision (names the owner).
+    local id="$1" dir="$2"
+    local f name owner target
+    cli_init
+    while IFS= read -r f; do
+        name=$(basename "$f")
+        target="$dir/$f"
+        owner=$(cli_index_get "$name")
+        if [[ -n $owner ]]; then
+            local owner_id
+            owner_id=$(jq -r '.id // ""' <<<"$owner")
+            if [[ $owner_id != "$id" ]]; then
+                fail "plugin '$id' ships command '$name' already owned by plugin '$owner_id'"
+            fi
+            continue
+        fi
+        if [[ -e $CLI_DIR/$name || -L $CLI_DIR/$name ]]; then
+            fail "command name '$name' from plugin '$id' collides with an unmanaged file at $CLI_DIR/$name"
+        fi
+        ln -sfn "$target" "$CLI_DIR/$name"
+        cli_index_set "$name" "$id" "$target"
+        local ent
+        ent=$(jq --arg n "$name" '.clis = ((.clis // []) + [$n] | unique)' <<<"$(registry_get "$id")")
+        registry_set "$id" "$ent"
+        echo "linked command: $name ($id)"
+    done < <(cd "$dir" && find bin scripts -maxdepth 1 -type f -executable 2>/dev/null | sort)
+}
+
+unlink_plugin_clis() {
+    # $1 = plugin id -> removes its links + index rows
+    local id="$1" cmd row target
+    [[ -f $CLI_INDEX ]] || return 0
+    while IFS= read -r cmd; do
+        row=$(cli_index_get "$cmd")
+        [[ $(jq -r '.id // ""' <<<"$row") == "$id" ]] || continue
+        target=$(jq -r '.target // ""' <<<"$row")
+        if [[ -L $CLI_DIR/$cmd && $(readlink "$CLI_DIR/$cmd") == "$target" ]]; then
+            rm -f "$CLI_DIR/$cmd"
+        fi
+        local tmp="$CLI_INDEX.tmp.$$"
+        jq --arg c "$cmd" 'del(.links[$c])' "$CLI_INDEX" >"$tmp"
+        mv "$tmp" "$CLI_INDEX"
+        echo "unlinked command: $cmd ($id)"
+    done < <(jq -r '.links | keys[]' "$CLI_INDEX")
+}
+
+profile_store_path() {
+    # $1 = nix profile element name -> store path (first)
+    local name="$1"
+    nix profile list --json 2>/dev/null \
+        | jq -r --arg n "$name" '.elements | to_entries[] | select(.key == $n) | .value.storePaths[0] // empty' \
+        | head -1
+}
+profile_has() {
+    nix profile list --json 2>/dev/null \
+        | jq -e --arg n "$1" '.elements | has($n)' >/dev/null 2>&1
+}
+
+# ---- collision detection (precedence B) ----
+# Colliding keys, checked in order:
+#   1. plugin `id` (hard error like omarchy: refusing a second install)
+#   2. `barWidget.slot` (declared bar slot claim, e.g. "center:2" or "right")
+#   3. `shellToml` top-level keys the plugin's README/setup declares
+#      (opt-in: manifest `nixmarchy.shellTomlKeys: [...]`)
+# Non-keys: entryPoint FILENAMES ("ScreenBreaker.qml" in two different plugin
+# dirs collide textually but never at runtime — each plugin resolves under
+# its own dir). Winner: explicit `priority` (highest wins), else
+# last-installed wins.
+detect_collisions() {
+    local new_id="$1" new_dir="$2"
+    local new_manifest="$new_dir/manifest.json"
+    local new_slot new_keys old_manifest old_id entry old_slot old_keys k
+    new_slot=$(jq -r '.barWidget.slot // empty' "$new_manifest")
+    new_keys=$(jq -r '[(.nixmarchy.shellTomlKeys // [])[]] | join(" ")' "$new_manifest")
+    for old_manifest in "$PLUGINS_DIR"/*/manifest.json; do
+        [[ -f $old_manifest ]] || continue
+        old_id=$(jq -r '.id // ""' "$old_manifest")
+        [[ -n $old_id && $old_id != "$new_id" ]] || continue
+        registry_has "$old_id" || continue
+        entry=$(registry_get "$old_id")
+        [[ $(jq -r '.enabled // false' <<<"$entry") == "true" ]] || continue
+        old_slot=$(jq -r '.barWidget.slot // empty' "$old_manifest")
+        if [[ -n $new_slot && -n $old_slot && $new_slot == "$old_slot" ]]; then
+            printf 'barWidget.slot=%s (%s vs %s)\n' "$new_slot" "$old_id" "$new_id"
+        fi
+        old_keys=$(jq -r '[(.nixmarchy.shellTomlKeys // [])[]] | join(" ")' "$old_manifest")
+        for k in $new_keys; do
+            case " $old_keys " in
+                *" $k "*) printf 'shellToml key=%s (%s vs %s)\n' "$k" "$old_id" "$new_id" ;;
+            esac
+        done
+    done
+}
+
+# ---- commands ----
+
+
+# --- compat check (nixmarchy-specific) -------------------------------------
+# Warns at install time about things the nixmarchy host does not provide,
+# so the user can install a bar host or patch the plugin before proceeding.
+#   1. 'bar-widget' kind: nixmarchy has no bar host.
+#   2. qs.Ui components: the portal only ports a subset of Omarchy's Ui.
+NIXMARCHY_SUPPORTED_UI="Panel PanelKeyCatcher Button BorderSurface BorderOverlay TextField BarIconButton CursorSurface KeyboardPanel PanelSectionHeader PluginBarApi ToggleSwitch"
+
+check_compat() {
+    local dir="$1"
+    local manifest="$dir/manifest.json"
+    [[ -f $manifest ]] || return 0
+    local warn=0
+
+    # 1. bar-widget kinds
+    if jq -e '.kinds | index("bar-widget")' "$manifest" >/dev/null 2>&1; then
+        echo -e "  \033[0;33m[!] COMPAT WARNING: Plugin declares 'bar-widget' kind.\033[0m" >&2
+        echo -e "      nixmarchy has NO bar host: the widget UI will NOT be accessible\033[0m" >&2
+        echo -e "      (service half may still mount). Install a bar or patch the plugin.\033[0m" >&2
+        warn=1
+    fi
+
+    # 2. missing qs.Ui components
+    local used missing="" u
+    used=$(grep -rhoE 'Ui\.[A-Z][A-Za-z0-9]*' "$dir" --include='*.qml' 2>/dev/null | cut -d. -f2 | sort -u)
+    for u in $used; do
+        if ! echo " $NIXMARCHY_SUPPORTED_UI " | grep -q " $u "; then
+            missing="$missing $u"
+        fi
+    done
+    if [[ -n $missing ]]; then
+        echo -e "  \033[0;33m[!] COMPAT WARNING: Uses qs.Ui components not ported:$missing.\033[0m" >&2
+        echo -e "      Expect load errors like 'Type X is not a type' until ported.\033[0m" >&2
+        warn=1
+    fi
+
+    return $warn
+}
+
+cmd_install() {
+    local raw="$1" assume_yes="$2" priority="$3"
+    need git
+    need jq
+    need nix
+    registry_init
+
+    local url="$raw" page_id=""
+    if page_id=$(page_id_of "$raw"); then
+        fetch_catalog
+        url=$(catalog_entry "$page_id") \
+            || fail "plugin id '$page_id' not found in marketplace catalog (refresh with network and retry)"
+        [[ -n $url ]] || fail "plugin id '$page_id' has no repo in the catalog"
+        echo "Resolved $page_id -> $url"
+    fi
+    url=$(normalize_git_url "$url")
+    check_git_url "$url"
+
+    if [[ ! -t 0 || ! -t 1 ]] && (( ! assume_yes )); then
+        fail "refusing to install without confirmation; pass --yes"
+    fi
+    if (( ! assume_yes )); then
+        cat >&2 <<WARN
+
+  Plugins run as arbitrary, unsandboxed QML inside your long-lived
+  nixmarchy-shell process. Only add repos you trust, and review the
+  code before you enable it.
+
+      URL: $url
+
+WARN
+        read -r -p "Clone and add this plugin? [y/N] " ans </dev/tty || fail "aborted"
+        [[ $ans == [yY]* ]] || fail "aborted"
+    fi
+
+    local stage="$PLUGINS_DIR/.install.tmp.$$"
+    rm -rf "$stage"
+    if ! git clone --quiet -- "$url" "$stage" 2>/dev/null; then
+        rm -rf "$stage"
+        fail "failed to clone $url"
+    fi
+    cmd_validate "$stage" >/dev/null
+    if ! check_compat "$stage"; then
+        if [[ ${assume_yes:-0} -eq 0 && -t 0 && -t 1 ]]; then
+            read -r -p "  Install anyway? [y/N] " resp
+            [[ $resp == [yY]* ]] || { rm -rf "$stage"; fail "aborted by user"; }
+        fi
+    fi
+    local id rev
+    id=$(jq -r '.id' "$stage/manifest.json")
+    rev=$(git -C "$stage" rev-parse HEAD)
+
+    local target="$PLUGINS_DIR/$id"
+    if registry_has "$id"; then
+        local existing_rev
+        existing_rev=$(jq -r '.rev // ""' <<<"$(registry_get "$id")")
+        rm -rf "$stage"
+        if [[ $existing_rev == "$rev" ]]; then
+            echo "$id already installed at $rev (no-op)"
+            return 0
+        fi
+        fail "plugin id '$id' is already installed at $existing_rev; run: nixmarchy update $id"
+    fi
+    if [[ -e $target || -L $target ]]; then
+        # Orphaned checkout (previous run died after mv): validate + adopt it.
+        cmd_validate "$target" >/dev/null
+        local orphan_rev
+        orphan_rev=$(git -C "$target" rev-parse HEAD 2>/dev/null || echo "")
+        rm -rf "$stage"
+        if [[ $orphan_rev == "$rev" ]]; then
+            echo "$id found installed at $rev, adopting"
+        else
+            fail "plugin dir '$target' exists but is not a clean $rev checkout; remove it or run: nixmarchy update $id"
+        fi
+    else
+        mv "$stage" "$target"
+    fi
+
+    # Collision scan vs currently-enabled plugins (precedence B warning)
+    local collisions
+    collisions=$(detect_collisions "$id" "$target")
+    if [[ -n $collisions ]]; then
+        while IFS= read -r key; do
+            [[ -n $key ]] || continue
+            echo "warning: plugin '$id' collides on $key with an installed enabled plugin (precedence: explicit priority, else last-installed wins)" >&2
+        done <<<"$collisions"
+    fi
+
+    # Record rev pin; profile wiring happens immutably via nix below.
+    local entry
+    entry=$(jq -cn --arg url "$url" --arg rev "$rev" --argjson prio "${priority:-0}" \
+        '{url:$url, rev:$rev, enabled:false, priority:$prio, installedAt:(now|todate), storePath:"", clis:[]}')
+    registry_set "$id" "$entry"
+    local link_dir
+    link_dir=$(normalize_plugin_shebangs "$id" "$target")
+    link_plugin_to_profile "$id" "$link_dir"
+    link_plugin_clis "$id" "$link_dir"
+
+    # Enable immediately: nixmarchy install behaves like `omarchy plugin add --enable`.
+    set_enabled "$id" true
+    echo "Installed and enabled $id ($rev)"
+    rescan_shell
+}
+
+store_add_plugin() {
+    # $1 = plugin id, $2 = checkout dir -> prints immutable store path
+    # (no .git, fixed perms). Verified primitive: `nix store add <dir>` then
+    # `nix profile add --priority 10 <storepath>` lands a
+    # `nixmarchy-plugin-<id>` element in `nix profile list`.
+    local id="$1"
+    local dir="$2"
+    local work spath
+    work=$(mktemp -d)
+    cp -a "$dir/." "$work/"
+    chmod -R u+w "$work"
+    rm -rf "$work/.git"
+    spath=$(nix store add --name "nixmarchy-plugin-$id" "$work" 2>/dev/null | tail -1)
+    rm -rf "$work"
+    [[ -n $spath && -d $spath ]] || fail "nix store add failed for $dir"
+    printf '%s' "$spath"
+}
+normalize_plugin_shebangs() {
+    # $1 = plugin id, $2 = plugin dir. Prints the dir to LINK (stdout).
+    #
+    # Omarchy plugins target Arch, where /bin/bash exists; NixOS ships only
+    # /bin/sh. A script whose interpreter is missing dies at execve, and
+    # Quickshell's Process fails silently ("binary could not be found"), so
+    # the plugin's UI mounts but stays blank - with no error surface at all.
+    # When any executable has a missing absolute interpreter, materialize a
+    # shebang-rewritten copy under $PATCH_DIR and link that instead.
+    #
+    # With services.envfs enabled /bin/bash resolves, `[[ -x ]]` passes, and
+    # this returns the original dir untouched (no copies).
+    local id="$1" dir="$2" f interp bad=()
+    while IFS= read -r f; do
+        interp=$(head -c 256 "$f" 2>/dev/null | sed -n '1s/^#![[:space:]]*//p' | awk '{print $1}')
+        [[ -n $interp && $interp == */* ]] || continue
+        [[ -x $interp ]] || bad+=("${f#"$dir"/}")
+    done < <(find "$dir" -type f -executable 2>/dev/null)
+    if ((${#bad[@]} == 0)); then
+        printf '%s\n' "$dir"
+        return 0
+    fi
+    local dst="${PATCH_DIR:?}/${id:?}" rel
+    rm -rf "$dst"
+    mkdir -p "$dst"
+    cp -RL "$dir/." "$dst/"
+    rm -rf "$dst/.git"
+    chmod -R u+w "$dst"
+    for rel in "${bad[@]}"; do
+        interp=$(head -c 256 "$dst/$rel" | sed -n '1s/^#![[:space:]]*//p' | awk '{print $1}')
+        sed -i "1s|^#!.*|#!/usr/bin/env $(basename "$interp")|" "$dst/$rel"
+        chmod +x "$dst/$rel"
+        echo "patched shebang: $rel: $interp -> #!/usr/bin/env $(basename "$interp")" >&2
+    done
+    printf '%s\n' "$dst"
+}
+
+link_plugin_to_profile() {
+    local id="$1" dir="$2"
+    local name spath
+    name=$(profile_name_for "$id")
+    if profile_has "$name"; then
+        nix profile remove "$name" 2>&1 | grep -v '^warning' >&2 || true
+    fi
+    spath=$(store_add_plugin "$id" "$dir")
+    # Deterministic element name; auto-bump profile priority on file
+    # collision (two plugins shipping the same top-level filename, e.g.
+    # preview.png): retry at 10..19, keep the first that sticks.
+    local prio out
+    for prio in 10 11 12 13 14 15 16 17 18 19; do
+        out=$(nix profile add --priority "$prio" "$spath" 2>&1) && break
+        if ! grep -q 'prioritise the existing package' <<<"$out"; then
+            echo "$out" >&2
+            break
+        fi
+        out=""
+    done
+    [[ -z ${out:-} ]] || echo "$out" >&2
+    local entry
+    entry=$(jq --arg sp "$spath" '.storePath = $sp' <<<"$(registry_get "$id")")
+    registry_set "$id" "$entry"
+    sync_profile_links
+}
+
+set_enabled() {
+    local id="$1" on="$2"
+    local entry
+    entry=$(jq --argjson on "$on" '.enabled = $on' <<<"$(registry_get "$id")")
+    registry_set "$id" "$entry"
+    write_shell_json
+}
+
+write_shell_json() {
+    local shell_json="$STATE_DIR/shell.json"
+    jq -n --slurpfile reg "$REGISTRY" '
+        { version: 1,
+          idle: { screensaver: 150, lock: 300 },
+          plugins: [ $reg[0].plugins | to_entries[] | select(.value.enabled) | .key ] }
+    ' >"$shell_json.tmp"
+    mv "$shell_json.tmp" "$shell_json"
+    # precedence-B sidecars the host reads: priority + installedAt per id
+    mkdir -p "$STATE_DIR/priority" "$STATE_DIR/installedAt"
+    local pid
+    while IFS=$'\t' read -r pid prio at; do
+        printf '%s' "$prio" >"$STATE_DIR/priority/$pid"
+        printf '%s' "$at" >"$STATE_DIR/installedAt/$pid"
+    done < <(jq -r '.plugins | to_entries[] | [.key, (.value.priority|tostring), (.value.installedAt // "")] | @tsv' "$REGISTRY")
+}
+
+rescan_shell() {
+    NIXMARCHY_SHELL_DIR="${NIXMARCHY_SHELL_DIR:-$HOME/.config/nixmarchy-shell}" nixmarchy-ipc shell rescan 2>/dev/null || true
+}
+
+cmd_summon_fallback() {
+    # $1=summon|hide|toggle rest=args. Host IPC first (shell may be dead or
+    # the plugin headless/bar-only); on failure and for summon only, fall
+    # back to the plugin CLI named after its last id segment (e.g. yautja
+    # for neil.yautja) when such a command is installed.
+    local verb="$1"
+    shift || true
+    local id="${1:-}"
+    if [[ -z $id ]]; then
+        cmd_ipc "$verb" "$@"
+        return $?
+    fi
+    if out=$(NIXMARCHY_SHELL_DIR="${NIXMARCHY_SHELL_DIR:-$HOME/.config/nixmarchy-shell}" nixmarchy-ipc "$verb" "$@" 2>&1); then
+        printf '%s\n' "$out"
+        return 0
+    fi
+    local host_err="$out"
+    if [[ $verb != summon ]]; then
+        printf '%s\n' "$host_err" >&2
+        return 1
+    fi
+    local base rc entry dir cli name
+    base="${id##*.}"
+    # Registry-recorded CLIs first (arbitrary binary names), then guesses.
+    if registry_has "$id"; then
+        while IFS= read -r name; do
+            [[ -n $name && -x $CLI_DIR/$name ]] || continue
+            echo "nixmarchy: '$id' has no mounted UI; running installed CLI '$name' instead" >&2
+            # NIXMARCHY_SUMMON_ARGS word-splits intentionally (argv passthrough).
+            # shellcheck disable=SC2086
+            "$CLI_DIR/$name" ${NIXMARCHY_SUMMON_ARGS:-}
+            rc=$?
+            return $rc
+        done < <(jq -r '(.clis // [])[]' <<<"$(registry_get "$id")")
+    fi
+    for cli in "$CLI_DIR/$id" "$CLI_DIR/$base"; do
+        [[ -x $cli ]] || continue
+        echo "nixmarchy: '$id' has no mounted UI; running installed CLI '$cli' instead" >&2
+        # NIXMARCHY_SUMMON_ARGS word-splits intentionally (argv passthrough).
+        # shellcheck disable=SC2086
+        "$cli" ${NIXMARCHY_SUMMON_ARGS:-}
+        rc=$?
+        return $rc
+    done
+    # No CLI either: surface the original host error.
+    printf '%s\n' "$host_err" >&2
+    return 1
+}
+
+cmd_list() {
+    registry_init
+    if [[ ${1:-} == "--json" ]]; then
+        jq -c '.plugins | to_entries | map({id:.key} + .value)' "$REGISTRY"
+        return 0
+    fi
+    printf '%-44s %-9s %-8s %s\n' "ID" "STATE" "PRIORITY" "REV"
+    jq -r '.plugins | to_entries[] | [.key, (if .value.enabled then "enabled" else "disabled" end), (.value.priority|tostring), (.value.rev[0:12])] | @tsv' "$REGISTRY" \
+        | while IFS=$'\t' read -r id state prio rev; do
+            printf '%-44s %-9s %-8s %s\n' "$id" "$state" "$prio" "$rev"
+        done
+}
+
+cmd_enable() {
+    local id="$1" prio="${2:-}"
+    registry_init
+    registry_has "$id" || fail "unknown plugin '$id'"
+    local entry
+    entry=$(registry_get "$id")
+    if [[ -n $prio ]]; then
+        entry=$(jq --argjson p "$prio" '.priority = $p' <<<"$entry")
+        registry_set "$id" "$entry"
+    fi
+    set_enabled "$id" true
+    rescan_shell
+    echo "Enabled $id"
+}
+
+cmd_disable() {
+    local id="$1"
+    registry_init
+    registry_has "$id" || fail "unknown plugin '$id'"
+    set_enabled "$id" false
+    rescan_shell
+    echo "Disabled $id"
+}
+
+cmd_ipc() {
+    exec nixmarchy-ipc "$@"
+}
+
+cmd_update() {
+    local id="${1:-}"
+    need git
+    registry_init
+    local ids=()
+    if [[ -n $id ]]; then
+        registry_has "$id" || fail "unknown plugin '$id'"
+        ids=("$id")
+    else
+        mapfile -t ids < <(jq -r '.plugins | keys[]' "$REGISTRY")
+    fi
+    local pid
+    for pid in "${ids[@]}"; do
+        local entry url old_rev target
+        entry=$(registry_get "$pid")
+        url=$(jq -r '.url' <<<"$entry")
+        old_rev=$(jq -r '.rev' <<<"$entry")
+        target="$PLUGINS_DIR/$pid"
+        local before after
+        before=$(git -C "$target" rev-parse HEAD 2>/dev/null || echo "?")
+        if ! git -C "$target" pull --ff-only --quiet 2>/dev/null; then
+            echo "nixmarchy: $pid: not fast-forwardable, skipping (resolve manually in $target)" >&2
+            continue
+        fi
+        after=$(git -C "$target" rev-parse HEAD)
+        if [[ $before == "$after" ]]; then
+            echo "$pid already at $after"
+            continue
+        fi
+        if ! cmd_validate "$target" >/dev/null; then
+            git -C "$target" reset --hard --quiet "$before"
+            echo "nixmarchy: $pid: new revision fails validation, rolled back to $before" >&2
+            continue
+        fi
+        local new_entry
+        new_entry=$(jq --arg rev "$after" '.rev = $rev | .storePath = ""' <<<"$entry")
+        registry_set "$pid" "$new_entry"
+        local link_dir
+        link_dir=$(normalize_plugin_shebangs "$pid" "$target")
+        link_plugin_to_profile "$pid" "$link_dir"
+        unlink_plugin_clis "$pid"
+        link_plugin_clis "$pid" "$link_dir"
+        echo "Updated $pid $old_rev -> $after"
+    done
+    rescan_shell
+}
+
+cmd_relink() {
+    # Re-pin the current checkout and re-point the profile link for one or all
+    # installed plugins. This is the activation step for a local divergence
+    # (see the ledger at the top of nixmarchy.nix): `update` deliberately
+    # refuses to fast-forward a diverged checkout, so a local patch would
+    # otherwise never reach the linked store path.
+    local id="$1"
+    registry_init
+    local ids=()
+    if [[ -n $id ]]; then
+        registry_has "$id" || fail "unknown plugin '$id'"
+        ids=("$id")
+    else
+        mapfile -t ids < <(jq -r '.plugins | keys[]' "$REGISTRY")
+    fi
+    local pid target rev entry link_dir
+    for pid in "${ids[@]}"; do
+        target="$PLUGINS_DIR/$pid"
+        if [[ ! -d $target ]]; then
+            echo "nixmarchy: $pid: no checkout at $target, skipping" >&2
+            continue
+        fi
+        rev=$(git -C "$target" rev-parse HEAD 2>/dev/null || echo "")
+        entry=$(jq --arg rev "$rev" '.rev = $rev | .storePath = ""' <<<"$(registry_get "$pid")")
+        registry_set "$pid" "$entry"
+        link_dir=$(normalize_plugin_shebangs "$pid" "$target")
+        link_plugin_to_profile "$pid" "$link_dir"
+        unlink_plugin_clis "$pid"
+        link_plugin_clis "$pid" "$link_dir"
+        echo "Relinked $pid ${rev:+($rev)}"
+    done
+    rescan_shell
+}
+
+cmd_remove() {
+    local id="$1"
+    registry_init
+    registry_has "$id" || fail "unknown plugin '$id'"
+    local target="$PLUGINS_DIR/$id"
+    local name
+    name=$(profile_name_for "$id")
+    if profile_has "$name"; then
+        nix profile remove "$name" 2>&1 | grep -v '^warning' >&2 || true
+    fi
+    local has_git=0
+    [[ -d $target/.git ]] && has_git=1
+    if ((has_git)); then
+        rm -rf "$target"
+    elif [[ -L $target ]]; then
+        rm -f "$target"
+    else
+        local backup
+        backup="$PLUGINS_DIR/.removed-$id-$(date +%s)"
+        mv "$target" "$backup"
+        echo "Moved hand-made plugin dir to $backup"
+    fi
+    rm -rf "${PATCH_DIR:?}/${id:?}"
+    rm -f "$HOME/.config/nixmarchy/plugins/$id"
+    unlink_plugin_clis "$id"
+    registry_del "$id"
+    write_shell_json
+    rescan_shell
+    echo "Removed $id"
+}
+
+usage() {
+    cat <<USAGE
+Usage: nixmarchy <command> [args]
+
+  install <git-url|plugin-page-url> [--yes] [--priority N]
+  list [--json]
+  enable <id> [--priority N] | disable <id>
+  summon <id> [payloadJson] | hide <id> | toggle <id> [payloadJson]
+    summon falls back to the plugin CLI (~/.local/bin/<id>) when the
+    plugin has no mounted UI (headless/service or bar-widget-only)
+  update [id] | remove <id> | validate [dir]
+  relink [id]
+    re-pin + relink installed plugin checkouts; activates a local divergence
+    patch (update refuses to fast-forward diverged checkouts)
+USAGE
+}
+
+main() {
+    local cmd="${1:-}"
+    shift || true
+    case "$cmd" in
+        install)
+            local raw="" yes=0 prio=0
+            while (($# > 0)); do
+                case "$1" in
+                    --yes | -y) yes=1; shift ;;
+                    --priority) prio="${2:-0}"; shift 2 ;;
+                    -h | --help) usage; exit 0 ;;
+                    -*) fail "unknown install option: $1" ;;
+                    *) [[ -z $raw ]] || fail "unexpected argument: $1"; raw="$1"; shift ;;
+                esac
+            done
+            [[ -n $raw ]] || fail "a git URL or plugin page URL is required"
+            cmd_install "$raw" "$yes" "$prio"
+            ;;
+        list) cmd_list "${1:-}" ;;
+        enable)
+            local id="${1:-}" prio=""
+            [[ -n $id ]] || fail "plugin id is required"
+            [[ ${2:-} == "--priority" ]] && prio="${3:-}"
+            cmd_enable "$id" "$prio"
+            ;;
+        disable)
+            [[ -n ${1:-} ]] || fail "plugin id is required"
+            cmd_disable "$1"
+            ;;
+        summon | hide | toggle) cmd_summon_fallback "$cmd" "$@" ;;
+        update) cmd_update "${1:-}" ;;
+        relink) cmd_relink "${1:-}" ;;
+        remove)
+            [[ -n ${1:-} ]] || fail "plugin id is required"
+            cmd_remove "$1"
+            ;;
+        validate) cmd_validate "${1:-}" ;;
+        -h | --help | "") usage; exit 0 ;;
+        *) fail "unknown command: $cmd" ;;
+    esac
+}
+
+main "$@"

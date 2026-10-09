@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# nixmarchy-ipc: talk to the running nixmarchy-shell over `qs ipc`.
+#
+#   nixmarchy-ipc shell <ping|list|summon|hide|toggle|isOpen|rescan|call> [args...]
+#   nixmarchy-ipc summon|hide|toggle <id> [payloadJson]
+#
+# `qs ipc call` needs a config selector matching the RUNNING shell:
+# prefer --path when the live config dir is known (NIXMARCHY_SHELL_DIR or the
+# default ~/.config/nixmarchy-shell), else fall back to -c nixmarchy-shell.
+# Exit 0 only when the shell answers "ok"/payload; "skip" or no instance
+# exits non-zero (quietly with NIXMARCHY_QUIET=1).
+
+set -euo pipefail
+
+fail() {
+    if [[ ${NIXMARCHY_QUIET:-0} == "1" ]]; then exit 1; fi
+    echo "nixmarchy-ipc: $*" >&2
+    exit 1
+}
+
+SHELL_DIR="${NIXMARCHY_SHELL_DIR:-$HOME/.config/nixmarchy-shell}"
+CONFIG_NAME="${NIXMARCHY_SHELL_CONFIG:-nixmarchy-shell}"
+
+sel=()
+if [[ -f $SHELL_DIR/shell.qml ]]; then
+    sel=(--path "$SHELL_DIR")
+else
+    sel=(--config "$CONFIG_NAME")
+fi
+
+instances() {
+    qs "${sel[@]}" ipc show 2>/dev/null | head -5
+}
+
+call() {
+    local target="$1" fn="$2"
+    shift 2
+    local out
+    if ! out=$(qs "${sel[@]}" ipc call "$target" "$fn" "$@" 2>&1); then
+        fail "no running nixmarchy-shell (${sel[*]}): $out"
+    fi
+    printf '%s' "$out"
+}
+
+[[ $# -ge 1 ]] || fail "usage: nixmarchy-ipc shell <method> [args...] | summon|hide|toggle <id> [payload]"
+
+case "$1" in
+    shell)
+        shift
+        [[ $# -ge 1 ]] || fail "shell method required"
+        method="$1"
+        shift
+        case "$method" in
+            ping | list | rescan) out=$(call shell "$method") ;;
+            summon | toggle) out=$(call shell "$method" "${1:?id required}" "${2:-{}}") ;;
+            hide | isOpen) out=$(call shell "$method" "${1:?id required}") ;;
+            call) out=$(call shell call "${1:?id required}" "${2:?fn required}" "${3:-null}") ;;
+            *) fail "unknown shell method: $method" ;;
+        esac
+        if [[ $out == "skip" ]]; then fail "shell skipped: $method $*"; fi
+        printf '%s\n' "$out"
+        ;;
+    summon | toggle)
+        cmd="$1" id="${2:?id required}" payload="${3:-{}}"
+        out=$(call shell "$cmd" "$id" "$payload")
+        [[ $out == "ok" ]] || fail "shell skipped: $cmd $id"
+        ;;
+    hide)
+        id="${2:?id required}"
+        out=$(call shell hide "$id")
+        [[ $out == "ok" ]] || fail "shell skipped: hide $id"
+        ;;
+    *) fail "unknown command: $1" ;;
+esac
