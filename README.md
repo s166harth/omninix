@@ -31,9 +31,10 @@ bash tests/cli-interface.test.sh   # one suite
 ```
 
 Zero dependencies beyond `bash`, `jq` and `python3`; hermetic (temp `$HOME`, stubbed `git`/`nix`/`qs`/`curl`,
-no network, no writes outside the temp dir). A suite that needs something this box lacks — a JS runtime
-(`node`/`bun`/`deno`) for `tests/js`, the real `quickshell` for the runtime layer of `tests/qml` — prints a
-counted `SKIP` with the reason instead of passing silently.
+no network, no writes outside the temp dir). `tests/js` runs a lane per JS engine it finds (`node`, `bun`,
+`deno` — PATH first, then `/nix/store`), and any suite that needs something this box lacks — no JS engine
+at all, or the real `quickshell` for the runtime layer of `tests/qml` — prints a counted `SKIP` with the
+reason instead of passing silently.
 
 ## Contracts plugins hard-code — never rename
 
