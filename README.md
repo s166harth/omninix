@@ -12,10 +12,10 @@ packaged yet — see `ROADMAP.md` (milestone **M0**: extract → rename to `omni
 | Path | What it is |
 |---|---|
 | `bin/nixmarchy` | CLI: `install`, `list`, `enable`/`disable`, `summon`/`hide`/`toggle`, `update`, `relink`, `remove`, `validate` (bash + jq) |
-| `bin/*` (5 more) | shims: `nixmarchy-ipc` (host IPC), `nixmarchy-shell-run` (launch host), `nixmarchy-/omarchy-notification-send`, `omarchy-menu-keybindings` |
+| `bin/*` (5 more) | shims: `nixmarchy-ipc` (host IPC), `nixmarchy-shell-run` (launch host), `nixmarchy-notification-send` / `omarchy-notification-send`, `omarchy-menu-keybindings` |
 | `shell/shell.qml` | the host: discovery, kind→entry-point mounting, priority/slot precedence, summon contract, IPC target `shell` |
 | `shell/{AppLibrary.qml,AppSearch.js,Cat.qml}` | app library + sync file reads exposed to plugins as `shell.appLibrary` |
-| `Commons.qs/qs/{Commons,Ui}` | the portal: `qs.Commons` (`Color`,`Style`,`Util`,`Border`) + 15 `qs.Ui` components, put on `QML_IMPORT_PATH` ahead of the plugin |
+| `Commons.qs/qs/{Commons,Ui}` | the portal: `qs.Commons` (`Color`,`Style`,`Util`,`Border`) + `qs.Ui` (13 components under 14 names — `Panel` ≡ `UiDummy`); put `Commons.qs`, the tree root, on `QML_IMPORT_PATH` ahead of the plugin |
 | `nixmarchy.nix` | home-manager module (packages, autostart, state) + per-plugin divergence ledger |
 | `tests/` | unit tests for everything above |
 
