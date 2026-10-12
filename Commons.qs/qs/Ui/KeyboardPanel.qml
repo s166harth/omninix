@@ -142,7 +142,7 @@ PanelWindow {
   // from vertical centering of the widget row), which is why `cardOrigin`
   // below uses `barH` for the perpendicular axis instead of this y.
   readonly property point anchorScreenPos: {
-    anchorWatcher.transform  // reactive dependency
+    anchorWatcher.trackedOffset  // reactive dependency
     if (!anchorItem || !anchorWindow) return Qt.point(0, 0)
     return anchorItem.mapToItem(anchorWindow.contentItem, 0, 0)
   }

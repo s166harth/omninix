@@ -13,3 +13,7 @@ PanelSectionHeader 1.0 PanelSectionHeader.qml
 PluginBarApi 1.0 PluginBarApi.qml
 ToggleSwitch 1.0 ToggleSwitch.qml
 PointerMoveGate 1.0 PointerMoveGate.qml
+BarWidget 1.0 BarWidget.qml
+WidgetButton 1.0 WidgetButton.qml
+OpticalGlyph 1.0 OpticalGlyph.qml
+TransformWatcher 1.0 TransformWatcher.qml

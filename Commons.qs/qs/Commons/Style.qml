@@ -7,8 +7,8 @@ import QtQuick
 // spacing tokens. This portal pins omarchy's DEFAULTS (base-size 12, spacing
 // scale 1.0, monospace) for the keys the installed plugins read (verified by
 // grep):
-//   Style.gapsOut, Style.cornerRadius, Style.space(px)
-//   Style.font.{family,resolvedFamily,menuFamily,baseSize,caption,bodySmall,
+//   Style.space(px) / Style.spaceReal(px), Style.duration(ms)
+//   Style.hoverFill, Style.selectedAccentFill, Style.selectionFillFor(...)
 //               body,subtitle,title,heading,icon,iconLarge,display,displayLarge}
 //   Style.spacing.{xxs,xs,sm,md,lg,xl,xxl,xxxl,huge,rowPaddingX,panelPadding,
 //                  popupPadding}
@@ -40,10 +40,32 @@ QtObject {
     readonly property int displayLarge: 28
   }
 
+  // Spacing scale. Upstream derives this from shell.toml; the portal pins the
+  // 1.0 default, so spaceReal() is a pass-through and space() still rounds.
+  // WidgetButton margins/padding route through spaceReal to keep the door
+  // open for a per-user scale later.
+  property real spacingScale: 1.0
+  property bool spacingScaleWithFont: true
+  readonly property real effectiveSpacingScale: spacingScale
+
+  // Animations collapse to 0 rather than being removed, so a Behavior still
+  // runs without visibly moving anything. Honoured by WidgetButton.
+  property bool reduceMotion: false
+
+  function spaceReal(px) {
+    var n = Number(px)
+    if (!isFinite(n) || n <= 0) return 0
+    return n * root.effectiveSpacingScale
+  }
+
+  function duration(ms) {
+    return root.reduceMotion ? 0 : ms
+  }
+
   function space(px) {
-    var n = Number(px);
-    if (!(n > 0)) return 0;
-    return Math.max(1, Math.round(n));
+    var n = root.spaceReal(px)
+    if (n <= 0) return 0
+    return Math.max(1, Math.round(n))
   }
 
   readonly property QtObject spacing: QtObject {
@@ -62,8 +84,17 @@ QtObject {
     readonly property int popupPadding: 14
   }
 
+  // Bar metrics. iconSlot/iconCanvas/iconSize/iconFont are what WidgetButton
+  // and BarIconButton size and align themselves against; the defaults are
+  // omarchy's quattro values (bar height 26, 27px slot, 16px canvas).
   readonly property QtObject bar: QtObject {
     readonly property int sizeHorizontal: 26
+    readonly property int sizeVertical: 28
+    readonly property int iconSlot: 27
+    readonly property int iconCanvas: 16
+    readonly property int iconFont: 13
+    readonly property int iconSize: 12
+    readonly property int statusSlot: 21
   }
 
   // No shell.toml here -> no per-user style overrides. Kept as a real map so
