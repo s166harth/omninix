@@ -137,5 +137,6 @@ in
   xdg.configFile."nixmarchy-shell/Cat.qml".source = ./shell/Cat.qml;
   xdg.configFile."nixmarchy-shell/AppLibrary.qml".source = ./shell/AppLibrary.qml;
   xdg.configFile."nixmarchy-shell/AppSearch.js".source = ./shell/AppSearch.js;
+  xdg.configFile."nixmarchy-shell/Bar.qml".source = ./shell/Bar.qml;
   xdg.configFile."nixmarchy/Commons.qs".source = ./Commons.qs;
 }

@@ -44,13 +44,28 @@ ShellRoot {
     return u.replace(/^file:\/\//, "").replace(/\/shell\.qml$/, "");
   }
   // id -> { dir, manifest(var), component(var|null), instance(var|null),
-  //         kinds[], enabled, priority, installedAt, error }
+  //         barInstance(var|null), kinds[], enabled, priority, installedAt, error }
   property var plugins: ({})
   property var enabledOrder: []
   // DesktopEntries-backed app library exposed to plugins as shell.appLibrary
   // (Omarchy injects an equivalent). evindor.keystroke's Applications provider
   // resolves installed apps through it; without it the palette shows none.
   AppLibrary { id: hostAppLibrary }
+  // Bar surface hosting `bar` / `bar-widget` plugin kinds (roadmap M5,
+  // minimal form). Widgets are mounted into its left/center/right sections
+  // and receive its PluginBarApi as their `bar`. Keystroke / Reader /
+  // Yautja need it: their entry point for those kinds is a bar widget, so
+  // without this surface their UI has nowhere to live.
+  //
+  // Quickshell 0.3.0 does not expose a PanelWindow child of ShellRoot as a
+  // property, so the surface hands itself over via barReady() and the host
+  // keeps it here.
+  property var hostBar: null
+  Bar {
+    id: hostBarSurface
+    shellFacadeFor: function(pluginId) { return root.shellFacade(pluginId) }
+    onBarReady: function(bar) { root.hostBar = bar }
+  }
   function log(msg) { console.log("nixmarchy-shell: " + msg) }
   function warn(msg) { console.warn("nixmarchy-shell: " + msg) }
   // Synchronous file reads via one-shot `cat` processes (FileView's QML
@@ -171,9 +186,22 @@ ShellRoot {
               dir: dir, manifest: m, enabled: on,
               kinds: m.kinds || [],
               component: (prev && prev.dir === dir) ? prev.component : null,
-              instance: null, error: ""
+              instance: null, error: "",
+              // Carried across rescan: the bar surface owns bar-widget
+              // instances, so a rescan must not mount a second copy of
+              // every widget it already holds.
+              barInstance: (prev && prev.dir === dir) ? (prev.barInstance || null) : null
             };
             if (on) order.push(id);
+          }
+          // A re-pinned checkout (new dir) invalidates whatever the bar is
+          // holding for that id; drop it so the remount uses the new source.
+          for (var movedId in root.plugins) {
+            var was = root.plugins[movedId], now = next[movedId];
+            if (was && was.barInstance && now && now.dir !== was.dir) {
+              root.hostBar.unmountWidget(movedId);
+              now.barInstance = null;
+            }
           }
           // destroy instances of removed/disabled plugins
           for (var oldId in root.plugins) {
@@ -203,14 +231,18 @@ ShellRoot {
 
   function unloadPlugin(id) {
     var p = root.plugins[id];
-    if (p && p.instance) { try { p.instance.destroy() } catch (e) {} }
+    // A bar-widget's only owner is the bar surface, so it is unmounted
+    // there rather than destroyed in place.
+    if (p && p.barInstance) { root.hostBar.unmountWidget(id); p.barInstance = null }
+    if (p && p.instance && p.instance !== p.barInstance) { try { p.instance.destroy() } catch (e) {} }
+    p.instance = null;
   }
 
   function mountEnabled() {
     for (var i = 0; i < root.enabledOrder.length; i++) {
       var id = root.enabledOrder[i];
       var p = root.plugins[id];
-      if (!p || p.instance) continue;
+      if (!p || p.instance || p.barInstance) continue;
       root.loadPlugin(id);
     }
   }
@@ -225,11 +257,13 @@ ShellRoot {
   function loadPlugin(id) {
     var p = root.plugins[id];
     if (!p) { root.warn("load: unknown " + id); return false }
-    // Service kinds mount headless; overlay/panel/menu mount hidden until open().
+    // Service kinds mount headless; overlay/panel/menu mount hidden until
+    // open(); bar/bar-widget mount into the bar surface's sections.
     for (var k = 0; k < p.kinds.length; k++) {
       var kind = p.kinds[k];
+      if (kind === "bar" || kind === "bar-widget") { root.loadBarWidget(id, p, kind); continue }
       if (["overlay", "service", "panel", "menu"].indexOf(kind) === -1) {
-        root.warn("load: " + id + ": kind '" + kind + "' not hosted (need bar host)");
+        root.warn("load: " + id + ": kind '" + kind + "' not hosted");
         continue;
       }
       var key = { "overlay": "overlay", "service": "service", "panel": "panel", "menu": "menu" }[kind];
@@ -245,7 +279,40 @@ ShellRoot {
       if (!inst) { p.error = "createObject failed"; root.warn("load: " + id + " " + kind + ": " + p.error); continue }
       if (!p.instance) p.instance = inst; // first UI kind is the summon target
     }
-    return !!p.instance;
+    return !!p.instance || !!p.barInstance;
+  }
+
+  // Mount a bar / bar-widget entry point into the bar surface's section.
+  // Returns the mounted instance or null; p.error carries the reason.
+  function loadBarWidget(id, p, kind) {
+    var key = kind === "bar" ? "bar" : "barWidget";
+    var file = root.entryFile(p, kind, key);
+    if (!file) { p.error = "missing entryPoints." + key; root.warn("load: " + id + ": " + p.error); return null }
+    var section = root.sectionOf(p.manifest, kind);
+    var defaults = root.barDefaults(p.manifest, kind);
+    var inst = root.hostBar.mountWidget(id, file, section, id, p.manifest, defaults);
+    if (!inst) { p.error = "bar createObject failed"; root.warn("load: " + id + " " + kind + ": " + p.error); return null }
+    p.barInstance = inst;
+    if (!p.instance) p.instance = inst;
+    return inst;
+  }
+
+  // barWidget.defaultSection (left|center|right), defaulting to left.
+  function sectionOf(manifest, kind) {
+    var s = "";
+    try {
+      var bw = kind === "bar" ? (manifest.bar || {}) : (manifest.barWidget || {});
+      s = String(bw.defaultSection || bw.section || "");
+    } catch (e) { s = "" }
+    return ["left", "center", "right"].indexOf(s) !== -1 ? s : "left";
+  }
+
+  // manifest.barWidget.defaults -> the widget's `settings` map.
+  function barDefaults(manifest, kind) {
+    try {
+      var bw = kind === "bar" ? (manifest.bar || {}) : (manifest.barWidget || {});
+      return bw.defaults || {};
+    } catch (e) { return {} }
   }
 
   // --- scoped shell facade (one per plugin id) ------------------------------
@@ -263,6 +330,14 @@ ShellRoot {
   function serviceFor(requestedId) {
     var key = String(requestedId || "");
     var route = root.cachedServices[key];
+    // A bar widget reaching for its OWN service by plugin id
+    // (Reader: bar.shell.serviceFor("clumzeez.reader")) expects the mounted
+    // headless `service` instance of that plugin, not a capability route.
+    // Resolve that before falling back to the omarchy.* routing table.
+    if (!route) {
+      var own = root.plugins[key];
+      if (own && own.instance && own.kinds && own.kinds.indexOf("service") !== -1) return own.instance;
+    }
     if (!route) {
       if (root.serviceProxies["__reject:" + key]) return root.serviceProxies["__reject:" + key];
       var rej = root.makeRejectProxy(key, "not routed");
@@ -539,6 +614,17 @@ ShellRoot {
     function rescan(): string {
       root.rescan(function(ok) {});
       return "ok";
+    }
+    // What the bar surface currently holds: id, section, visibility, size.
+    // Answers "[]" when the bar has not finished coming up.
+    function bar(): string { return root.hostBar ? root.hostBar.summary() : "[]" }
+    // Click a mounted bar widget: `barClick <id> [left|middle|right]`.
+    function barClick(id: string, button: string): string {
+      return root.hostBar ? root.hostBar.clickWidget(id, button || "left") : "no bar";
+    }
+    // Call a function on a mounted bar widget: `barCall <id> <fn> [argsJson]`.
+    function barCall(id: string, fn: string, args: string): string {
+      return root.hostBar ? root.hostBar.callWidget(id, fn, args || "[]") : "";
     }
   }
 

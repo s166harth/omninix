@@ -360,8 +360,12 @@ ShellRoot {
     out.api.style = {
       space4: String(Style.space(4)),
       space0: String(Style.space(0)),
-      baseSizePositive: Number(Style.font.baseSize) > 0,
-      gapsOutNonNegative: Number(Style.gapsOut) >= 0
+      baseSizePositive: String(Number(Style.font.baseSize) > 0),
+      gapsOutNonNegative: String(Number(Style.gapsOut) >= 0),
+      spaceReal: String(Style.spaceReal(4)),
+      durationPassthrough: String(Style.duration(140)),
+      barIconSlot: String(Style.bar.iconSlot),
+      barIconCanvas: String(Style.bar.iconCanvas)
     };
     out.api.util = {
       clampHigh: String(Util.clamp(9, 0, 5)),
@@ -402,6 +406,49 @@ ShellRoot {
                          fns: String(typeof b.registerClickTarget) + "," + String(typeof b.run) + ","
                               + String(typeof b.requestPopout) + "," + String(typeof b.switchPanelFrom) };
     } else out.api.barApi = { created: false, error: rb.error };
+
+    // Bar-hosting portal types. BarWidget is the base every bar widget
+    // extends (setting()/vertical/barSize), WidgetButton is what those
+    // widgets build their click targets from, OpticalGlyph fits an icon-font
+    // codepoint into its painted box, and TransformWatcher is what makes
+    // KeyboardPanel's card position reactive. All four must compile AND
+    // carry the surface their users read.
+    var rbw = inst(portal + "/qs/Ui/BarWidget.qml", {});
+    if (rbw.created) {
+      var bw = rbw.obj;
+      out.api.barWidget = { created: true,
+                           verticalNoBar: String(bw.vertical),
+                           barSizeFallback: String(bw.barSize),
+                           settingDefault: String(bw.setting("nope", 7)),
+                           settingFromMap: String(bw.setting("k", "fallback")),
+                           broadcastFn: String(typeof bw.broadcast) };
+    } else out.api.barWidget = { created: false, error: rbw.error };
+
+    var rw = inst(portal + "/qs/Ui/WidgetButton.qml", { text: "x" });
+    if (rw.created) {
+      var w = rw.obj;
+      out.api.widgetButton = { created: true,
+                              iconLabelPlain: String(w.isIconGlyph("A")),
+                              iconLabelPrivate: String(w.isIconGlyph("")),
+                              pressFn: String(typeof w.triggerPress),
+                              hasVisualContent: String(w.hasVisualContent) };
+    } else out.api.widgetButton = { created: false, error: rw.error };
+
+    var ro = inst(portal + "/qs/Ui/OpticalGlyph.qml", { text: "A", fontSize: 14 });
+    if (ro.created) {
+      var o = ro.obj;
+      out.api.opticalGlyph = { created: true,
+                               renderedFontSize: String(o.renderedFontSize),
+                               tightWidthPositive: String(Number(o.tightWidth) > 0) };
+    } else out.api.opticalGlyph = { created: false, error: ro.error };
+
+    var rtw = inst(portal + "/qs/Ui/TransformWatcher.qml", {});
+    if (rtw.created) {
+      var tw = rtw.obj;
+      out.api.transformWatcher = { created: true,
+                                   offsetNoEnds: String(tw.trackedOffset.x) + "," + String(tw.trackedOffset.y),
+                                   widthNoEnds: String(tw.trackedWidth) };
+    } else out.api.transformWatcher = { created: false, error: rtw.error };
 
     var rg = inst(portal + "/qs/Ui/PointerMoveGate.qml", {});
     if (rg.created) {
@@ -485,7 +532,10 @@ def cmd_parse(outfile):
         emit("api.color", "runtime: qs.Commons Color exposes a color accent and keeps its bindings", "fail",
              json.dumps(C))
     S = api.get("style", {})
-    if S.get("space4") == "4" and S.get("space0") == "0" and S.get("baseSizePositive") and S.get("gapsOutNonNegative"):
+    if S.get("space4") == "4" and S.get("space0") == "0" and S.get("baseSizePositive") == "true" \
+            and S.get("gapsOutNonNegative") == "true" and S.get("spaceReal") == "4" \
+            and S.get("durationPassthrough") == "140" and S.get("barIconSlot") == "27" \
+            and S.get("barIconCanvas") == "16":
         emit("api.style", "runtime: Style.space(px) returns px for positives and 0 otherwise", "pass")
     else:
         emit("api.style", "runtime: Style.space(px) returns px for positives and 0 otherwise", "fail", json.dumps(S))
@@ -531,6 +581,48 @@ def cmd_parse(outfile):
         emit("api.gate", "runtime: qs.Ui.PointerMoveGate filters the initial pointer sample", "pass")
     else:
         emit("api.gate", "runtime: qs.Ui.PointerMoveGate filters the initial pointer sample", "fail", json.dumps(G))
+
+    BW = api.get("barWidget", {})
+    if not BW.get("created"):
+        emit("api.barWidget", "runtime: qs.Ui.BarWidget carries bar geometry, setting() and broadcast()", "skip",
+             "BarWidget could not be created - " + last_line(BW.get("error")))
+    elif BW.get("verticalNoBar") == "false" and BW.get("barSizeFallback") == "26" \
+            and BW.get("settingDefault") == "7" and BW.get("settingFromMap") == "fallback" \
+            and BW.get("broadcastFn") == "function":
+        emit("api.barWidget", "runtime: qs.Ui.BarWidget carries bar geometry, setting() and broadcast()", "pass")
+    else:
+        emit("api.barWidget", "runtime: qs.Ui.BarWidget carries bar geometry, setting() and broadcast()", "fail",
+             json.dumps(BW))
+
+    WB = api.get("widgetButton", {})
+    if not WB.get("created"):
+        emit("api.widgetButton", "runtime: qs.Ui.WidgetButton detects icon glyphs and exposes press handling", "skip",
+             "WidgetButton could not be created - " + last_line(WB.get("error")))
+    elif WB.get("iconLabelPlain") == "false" and WB.get("iconLabelPrivate") == "true" \
+            and WB.get("pressFn") == "function" and WB.get("hasVisualContent") == "true":
+        emit("api.widgetButton", "runtime: qs.Ui.WidgetButton detects icon glyphs and exposes press handling", "pass")
+    else:
+        emit("api.widgetButton", "runtime: qs.Ui.WidgetButton detects icon glyphs and exposes press handling", "fail",
+             json.dumps(WB))
+
+    OG = api.get("opticalGlyph", {})
+    if not OG.get("created"):
+        emit("api.opticalGlyph", "runtime: qs.Ui.OpticalGlyph measures a glyph's painted box", "skip",
+             "OpticalGlyph could not be created - " + last_line(OG.get("error")))
+    elif OG.get("renderedFontSize") == "14" and OG.get("tightWidthPositive") == "true":
+        emit("api.opticalGlyph", "runtime: qs.Ui.OpticalGlyph measures a glyph's painted box", "pass")
+    else:
+        emit("api.opticalGlyph", "runtime: qs.Ui.OpticalGlyph measures a glyph's painted box", "fail", json.dumps(OG))
+
+    TW = api.get("transformWatcher", {})
+    if not TW.get("created"):
+        emit("api.transformWatcher", "runtime: qs.Ui.TransformWatcher reports a safe offset with no endpoints", "skip",
+             "TransformWatcher could not be created - " + last_line(TW.get("error")))
+    elif TW.get("offsetNoEnds") == "0,0" and TW.get("widthNoEnds") == "0":
+        emit("api.transformWatcher", "runtime: qs.Ui.TransformWatcher reports a safe offset with no endpoints", "pass")
+    else:
+        emit("api.transformWatcher", "runtime: qs.Ui.TransformWatcher reports a safe offset with no endpoints",
+             "fail", json.dumps(TW))
 
 
 def main():

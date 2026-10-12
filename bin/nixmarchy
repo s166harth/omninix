@@ -348,9 +348,11 @@ detect_collisions() {
 # --- compat check (nixmarchy-specific) -------------------------------------
 # Warns at install time about things the nixmarchy host does not provide,
 # so the user can install a bar host or patch the plugin before proceeding.
-#   1. 'bar-widget' kind: nixmarchy has no bar host.
+#   1. 'bar-widget' kind: hosted by shell/Bar.qml, but a bar entry point that
+#      names qs.Ui types the portal does not carry will still fail to mount.
 #   2. qs.Ui components: the portal only ports a subset of Omarchy's Ui.
-NIXMARCHY_SUPPORTED_UI="Panel PanelKeyCatcher Button BorderSurface BorderOverlay TextField BarIconButton CursorSurface KeyboardPanel PanelSectionHeader PluginBarApi ToggleSwitch"
+NIXMARCHY_SUPPORTED_UI="Panel UiDummy PanelKeyCatcher Button BorderSurface BorderOverlay TextField BarIconButton CursorSurface KeyboardPanel PanelSectionHeader PluginBarApi ToggleSwitch PointerMoveGate BarWidget WidgetButton OpticalGlyph TransformWatcher"
+
 
 check_compat() {
     local dir="$1"
@@ -358,11 +360,15 @@ check_compat() {
     [[ -f $manifest ]] || return 0
     local warn=0
 
-    # 1. bar-widget kinds
-    if jq -e '.kinds | index("bar-widget")' "$manifest" >/dev/null 2>&1; then
-        echo -e "  \033[0;33m[!] COMPAT WARNING: Plugin declares 'bar-widget' kind.\033[0m" >&2
-        echo -e "      nixmarchy has NO bar host: the widget UI will NOT be accessible\033[0m" >&2
-        echo -e "      (service half may still mount). Install a bar or patch the plugin.\033[0m" >&2
+    # 1. bar / bar-widget kinds: hosted, but only if the entry point's
+    #    qs.Ui dependencies exist. Missing types are reported by check 2.
+    if jq -e '.kinds | index("bar-widget") // empty' "$manifest" >/dev/null 2>&1 \
+        || jq -e '.kinds | index("bar") // empty' "$manifest" >/dev/null 2>&1; then
+        local bk
+        bk=$(jq -r '.kinds | map(select(. == "bar" or . == "bar-widget")) | join(", ")' "$manifest" 2>/dev/null)
+        echo -e "  \033[0;33m[!] COMPAT WARNING: Plugin declares bar kind(s):$bk.\033[0m" >&2
+        echo -e "      nixmarchy hosts them in its own minimal bar (shell/Bar.qml);\033[0m" >&2
+        echo -e "      the widget mounts there, without Omarchy's indicators/chrome.\033[0m" >&2
         warn=1
     fi
 
