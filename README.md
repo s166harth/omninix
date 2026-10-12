@@ -1,4 +1,4 @@
-# nixmarchy
+# OMNINIX
 
 Run **Omarchy Quickshell plugins** on **NixOS / plain Nix** — no Arch, no Omarchy, no rebuild:
 a Quickshell host that mounts third-party plugins by `manifest.json` kind, the
